@@ -91,8 +91,8 @@ summary{font-weight:700;cursor:pointer;min-height:32px}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script></head>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script></head>
 <body>
 <a class="skip" href="#main">Pular para o conteúdo</a>
 <header><div class="wrap top">
@@ -142,7 +142,7 @@ summary{font-weight:700;cursor:pointer;min-height:32px}
 <p class="lead">Confira o resultado de cada arquivo. O registro guarda o tipo e o local de cada remoção, nunca o valor removido.</p>
 <div class="tw"><table><caption class="sr">Resultado por arquivo</caption><thead><tr><th scope="col">Arquivo</th><th scope="col">Removidos</th><th scope="col">Mantidos</th><th scope="col">Verificação</th><th scope="col">Ações</th></tr></thead><tbody id="sum"></tbody></table></div>
 <div class="row"><button class="p" id="zip">Baixar tudo em ZIP</button><button id="b2">Voltar à revisão</button><span class="meta" id="msg" role="status"></span></div>
-<p class="meta">O ZIP traz <code>protegidos/</code> (texto protegido em .txt, sem a formatação original) e <code>registros/</code> (um CSV por arquivo).</p>
+<p class="meta">O ZIP traz <code>protegidos/</code> (arquivos originais editados; em PDF, as páginas viram imagem com tarjas pretas) e <code>registros/</code> (um CSV por arquivo).</p>
 <h3 style="margin-top:24px">Registro de remoções</h3><p class="meta" id="hdr"></p>
 <div class="tw"><table><caption class="sr">Registro de remoções do arquivo selecionado</caption><thead><tr><th scope="col">Nº</th><th scope="col">Tipo</th><th scope="col">Local (linha:coluna)</th><th scope="col">Origem da sugestão</th><th scope="col">Decidido por</th><th scope="col">Horário</th></tr></thead><tbody id="log"></tbody></table></div>
 </section>
@@ -202,23 +202,51 @@ function detect(s){
  out.sort((x,y)=>x.a-y.a||y.c-x.c||(y.b-y.a)-(x.b-x.a));
  const r=[];let end=0;for(const f of out){if(f.a>=end){r.push(f);end=f.b}}return r}
 const dx=s=>s.replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,"&");
-async function readFile(f){
- const ext=f.name.split(".").pop().toLowerCase(),buf=await f.arrayBuffer();
- if(ext=="pdf"){pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";const p=await pdfjsLib.getDocument({data:buf}).promise;let t="";
+const enc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const rxEsc=t=>new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');
+/* partes do Office que contêm texto (usado na leitura e na proteção) */
+const officeParts=(ext,n)=>ext=="docx"?/^word\/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml$/.test(n):/^ppt\/(slides|notesSlides)\/[^/]+\.xml$/.test(n);
+
+/* Junta os trechos <w:t>/<a:t> de cada parágrafo, procura os termos no texto contínuo
+   e apaga os caracteres encontrados, mesmo quando o Word/PowerPoint dividiu o valor em vários trechos. */
+function redactXml(xml,terms){
+ const pRe=/<(w|a):p[ >][\s\S]*?<\/\1:p>/g;
+ const tRe=/(<(?:w|a):t(?:\s[^>]*)?>)([\s\S]*?)(<\/(?:w|a):t>)/g;
+ const res=terms.map(rxEsc);
+ return xml.replace(pRe,p=>{
+  const nodes=[...p.matchAll(tRe)];if(!nodes.length)return p;
+  const texts=nodes.map(m=>dx(m[2])),full=texts.join("");
+  const mask=new Uint8Array(full.length),start=new Uint8Array(full.length);
+  res.forEach(re=>{for(const m of full.matchAll(re)){if(!m[0].length)continue;start[m.index]=1;for(let i=m.index;i<m.index+m[0].length;i++)mask[i]=1}});
+  if(!mask.includes(1))return p;
+  let off=0,k=0;
+  return p.replace(tRe,(all,o,_t,c)=>{const t=texts[k++];let out="";
+   for(let i=0;i<t.length;i++){const g=off+i;if(mask[g]){if(start[g])out+="█████"}else out+=t[i]}
+   off+=t.length;return o+enc(out)+c})})}
+
+async function parseTextFromBuf(buf, ext){
+ if(ext=="pdf"){pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";const p=await pdfjsLib.getDocument({data:new Uint8Array(buf.slice(0))}).promise;let t="";
   for(let i=1;i<=p.numPages;i++){const c=await(await p.getPage(i)).getTextContent();c.items.forEach(x=>{t+=x.str+(x.hasEOL?"\n":" ")});t+="\n\n"}
   if(t.trim().length<5)throw new Error("PDF sem texto selecionável (digitalizado?). OCR não incluído.");return t}
- if(ext=="docx"||ext=="pptx"){const z=await JSZip.loadAsync(buf);
-  const names=Object.keys(z.files).filter(n=>ext=="docx"?/^word\/(document|header\d*|footer\d*|footnotes)\.xml$/.test(n):/^ppt\/(slides|notesSlides)\/[^/]+\.xml$/.test(n)).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+ if(ext=="docx"||ext=="pptx"){const z=await JSZip.loadAsync(new Uint8Array(buf.slice(0)));
+  const names=Object.keys(z.files).filter(n=>officeParts(ext,n)).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
   let t="";for(const n of names){const x=await z.files[n].async("string");t+=dx(x.replace(/<\/(w|a):p>/g,"\n").replace(/<w:tab\/>/g,"\t").replace(/<[^>]+>/g,""))+"\n"}return t}
- if(["xlsx","xls","csv"].includes(ext)){const w=XLSX.read(buf);return w.SheetNames.map(n=>"## "+n+"\n"+XLSX.utils.sheet_to_csv(w.Sheets[n])).join("\n\n")}
+ if(["xlsx","xls","csv"].includes(ext)){const w=XLSX.read(new Uint8Array(buf.slice(0)),{type:"array"});return w.SheetNames.map(n=>"## "+n+"\n"+XLSX.utils.sheet_to_csv(w.Sheets[n])).join("\n\n")}
  if(ext=="eml"||ext=="txt")return new TextDecoder().decode(buf);
  throw new Error("Formato não suportado.")}
+
 async function addFiles(list){
  list=[...list];const room=MAX-files.length;let m="";
  if(list.length>room){m=`Limite de ${MAX} arquivos: ${list.length-room} ignorado(s). `;list=list.slice(0,room)}
  for(const f of list){$("amsg").textContent=m+"Lendo "+f.name+"…";
-  try{files.push({name:f.name,text:await readFile(f),F:[],dec:{}})}catch(e){files.push({name:f.name,text:"",F:[],dec:{},err:e.message||"Erro ao ler"})}}
+  try{
+    const buf=await f.arrayBuffer();
+    const ext=f.name.split(".").pop().toLowerCase();
+    const text=await parseTextFromBuf(buf.slice(0),ext); // o parser recebe uma cópia
+    files.push({name:f.name,buf:buf,text:text,F:[],dec:{}});
+  }catch(e){files.push({name:f.name,text:"",F:[],dec:{},err:e.message||"Erro ao ler"})}}
  $("amsg").textContent=m+files.length+" arquivo(s) carregado(s).";drawFiles()}
+
 function drawFiles(){$("fl").innerHTML=files.map((f,i)=>`<li><span class="n">${esc(f.name)}${f.err?`<br><span class="err">${esc(f.err)}</span>`:""}</span><button class="sm" data-r="${i}" aria-label="Remover ${esc(f.name)} da lista">Tirar</button></li>`).join("")}
 $("fl").onclick=e=>{const b=e.target.closest("button");if(b){const n=files.splice(+b.dataset.r,1)[0];drawFiles();say(n.name+" tirado da lista")}};
 const STEPS=["s1","s2","s3"];
@@ -237,7 +265,7 @@ function render(){
  $("cur").textContent="Arquivo: "+cf.name;
  const c=cnt(cf);$("cnt").innerHTML=`<span class="chip">${c.ok+c.no+c.pend} dados neste arquivo</span><span class="chip">✕ ${c.ok} remover</span><span class="chip">✓ ${c.no} manter</span><span class="chip">● ${c.pend} sem decisão</span>`;
  const text=cf.text,F=cf.F;let h="",p=0;
- F.forEach(f=>{const d=cf.dec[key(f)]||"pend";h+=esc(text.slice(p,f.a))+`<mark class="${d}" data-k="${esc(key(f))}">${d=="ok"?esc("["+f.t+" removido]"):esc(f.v)}</mark>`;p=f.b});
+ F.forEach(f=>{const d=cf.dec[key(f)]||"pend";h+=esc(text.slice(p,f.a))+`<mark class="${d}" data-k="${esc(key(f))}">${d=="ok"?esc("█████"):esc(f.v)}</mark>`;p=f.b});
  $("doc").innerHTML=h+esc(text.slice(p));
  const G=new Map();F.forEach(f=>{const k=key(f);if(!G.has(k))G.set(k,{...f,k,n:0});G.get(k).n++});
  const L={ok:["✕ Será removido","ok"],no:["✓ Será mantido","no"],pend:["● Sem decisão","pend"]};
@@ -264,38 +292,178 @@ const fi=$("fi");$("drop").onclick=()=>fi.click();fi.onchange=async e=>{await ad
 const dr=$("drop");["dragenter","dragover"].forEach(v=>dr.addEventListener(v,e=>{e.preventDefault();dr.classList.add("over")}));
 ["dragleave","drop"].forEach(v=>dr.addEventListener(v,e=>{e.preventDefault();dr.classList.remove("over")}));
 dr.addEventListener("drop",e=>addFiles(e.dataTransfer.files));
-$("ex").onclick=()=>{SAMPLES.forEach(s=>files.push({name:s.name,text:s.text,F:[],dec:{}}));$("amsg").textContent=files.length+" arquivo(s) carregado(s).";drawFiles()};
+
+$("ex").onclick=()=>{
+  SAMPLES.forEach(s=>{
+    const buf=new TextEncoder().encode(s.text).buffer;
+    files.push({name:s.name,buf:buf,text:s.text,F:[],dec:{}});
+  });
+  $("amsg").textContent=files.length+" arquivo(s) carregado(s).";
+  drawFiles();
+};
+
 $("clr").onclick=()=>{files=[];manual=[];sel=0;outs=[];$("amsg").textContent="";drawFiles();go(0);say("Tudo foi limpo")};
-async function sha(s){try{const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("").slice(0,16)}catch(e){return"indisponível"}}
+async function sha(s){try{const b=await crypto.subtle.digest("SHA-256",typeof s==='string'?new TextEncoder().encode(s):s);return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("").slice(0,16)}catch(e){return"indisponível"}}
 const base=n=>n.replace(/[\\/:*?"<>|]/g,"_");
+
+/* PDF: desenha cada página, pinta tarjas pretas sobre os termos e remonta um PDF novo */
+async function redactPdf(buf, terms, fileObj){
+ pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+ const pdf=await pdfjsLib.getDocument({data:new Uint8Array(buf.slice(0))}).promise;
+ const res=terms.map(t=>({t,re:rxEsc(t)})),found=new Set(),SC=2;
+ let doc=null;
+ for(let n=1;n<=pdf.numPages;n++){
+  const page=await pdf.getPage(n);
+  const vp=page.getViewport({scale:SC}),v1=page.getViewport({scale:1});
+  const cv=document.createElement("canvas");cv.width=Math.ceil(vp.width);cv.height=Math.ceil(vp.height);
+  const ctx=cv.getContext("2d");
+  await page.render({canvasContext:ctx,viewport:vp}).promise;
+  const tc=await page.getTextContent();
+  // mesmo formato de texto usado na leitura (item + espaço ou quebra de linha)
+  let full="";const spans=[];
+  tc.items.forEach(it=>{if(typeof it.str!=="string")return;
+   spans.push({s:full.length,e:full.length+it.str.length,it});
+   full+=it.str+(it.hasEOL?"\n":" ")});
+  ctx.fillStyle="#000";
+  res.forEach(({t,re})=>{
+   for(const m of full.matchAll(re)){
+    if(!m[0].length)continue;
+    const a=m.index,b=m.index+m[0].length;
+    spans.forEach(sp=>{
+     const i0=Math.max(a,sp.s),i1=Math.min(b,sp.e);
+     if(i1<=i0||sp.e===sp.s)return;
+     const len=sp.e-sp.s,tr=pdfjsLib.Util.transform(vp.transform,sp.it.transform);
+     const w=sp.it.width*SC,h=Math.hypot(tr[2],tr[3]);
+     const x=tr[4]+w*((i0-sp.s)/len),ww=w*((i1-i0)/len);
+     ctx.fillRect(x-2,tr[5]-h*0.95,ww+4,h*1.25);
+     found.add(t)})}});
+  const img=cv.toDataURL("image/jpeg",0.88);
+  const W=v1.width,H=v1.height,o=W>H?"l":"p";
+  if(!doc)doc=new window.jspdf.jsPDF({unit:"pt",format:[W,H],orientation:o});
+  else doc.addPage([W,H],o);
+  doc.addImage(img,"JPEG",0,0,W,H);
+ }
+ // termos que não foram localizados no desenho da página (ficam avisados na verificação)
+ fileObj.missed=terms.filter(t=>!found.has(t));
+ return new Uint8Array(doc.output("arraybuffer"));
+}
+
+async function buildProtectedFile(fileObj, termsToRemove) {
+  const ext = fileObj.name.split(".").pop().toLowerCase();
+
+  if (termsToRemove.length === 0) {
+    return new Uint8Array(fileObj.buf.slice(0));
+  }
+
+  // cópia nova a cada chamada: nenhuma biblioteca consegue esvaziar o original
+  const safeBuffer = new Uint8Array(fileObj.buf.slice(0));
+
+  // 1. DOCX e PPTX: junta os trechos de cada parágrafo antes de procurar os termos
+  if (ext === "docx" || ext === "pptx") {
+    const zip = await JSZip.loadAsync(safeBuffer);
+    const targetFiles = Object.keys(zip.files).filter(n => officeParts(ext, n));
+    for (const name of targetFiles) {
+      const content = await zip.files[name].async("string");
+      zip.file(name, redactXml(content, termsToRemove));
+    }
+    return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+  }
+
+  // 2. Planilhas (XLSX, XLS, CSV)
+  if (["xlsx", "xls", "csv"].includes(ext)) {
+    const wb = XLSX.read(safeBuffer, { type: "array" });
+    wb.SheetNames.forEach(sheetName => {
+      const sheet = wb.Sheets[sheetName];
+      for (const cell in sheet) {
+        if (cell[0] === '!') continue;
+        if (sheet[cell].v && typeof sheet[cell].v === 'string') {
+          let val = sheet[cell].v;
+          termsToRemove.forEach(term => { val = val.replace(rxEsc(term), "█████"); });
+          sheet[cell].v = val;
+          if (sheet[cell].w) sheet[cell].w = val;
+        }
+      }
+    });
+    if (ext === "csv") {
+      return new TextEncoder().encode(XLSX.utils.sheet_to_csv(wb.Sheets[wb.SheetNames[0]]));
+    }
+    return new Uint8Array(XLSX.write(wb, { bookType: ext === "xls" ? "xls" : "xlsx", type: "array" }));
+  }
+
+  // 3. TXT e EML
+  if (ext === "txt" || ext === "eml") {
+    let text = new TextDecoder().decode(safeBuffer);
+    termsToRemove.forEach(term => { text = text.replace(rxEsc(term), "█████"); });
+    return new TextEncoder().encode(text);
+  }
+
+  // 4. PDF: redação real (tarjas pretas) e novo PDF
+  if (ext === "pdf") {
+    return await redactPdf(fileObj.buf, termsToRemove, fileObj);
+  }
+
+  return new Uint8Array(fileObj.buf.slice(0));
+}
+
 $("prot").onclick=async()=>{
  const when=new Date().toLocaleString("pt-BR");outs=[];
- for(const [i,f] of files.entries()){if(f.err)continue;const text=f.text;let r="",p=0;const rows=[];
+ $("amsg").textContent="";
+ try{
+ for(const [i,f] of files.entries()){if(f.err)continue;
+  const text=f.text;const rows=[];
   const acc=f.F.filter(x=>f.dec[key(x)]=="ok");
-  acc.forEach((x,j)=>{r+=text.slice(p,x.a)+"["+x.t+" removido]";p=x.b;const ls=text.slice(0,x.a).split("\n");rows.push([j+1,x.t,ls.length+":"+(ls[ls.length-1].length+1),x.src,"pessoa",when])});
-  r+=text.slice(p);
-  const left=[...new Set(acc.map(x=>x.v))].filter(v=>r.toLowerCase().includes(v.toLowerCase()));
-  const h1=await sha(text),h2=await sha(r),id=String(i+1).padStart(3,"0")+"_"+base(f.name);
-  outs.push({name:f.name,id,r,rows,left:left.length,kept:f.F.length-acc.length,h1,h2,
-   csv:"\ufeffarquivo;"+f.name+"\nhash_original;"+h1+"\nhash_protegido;"+h2+"\n#;tipo;local;origem;decidido_por;horario\n"+rows.map(x=>x.join(";")).join("\n")})}
+  acc.forEach((x,j)=>{
+    const ls=text.slice(0,x.a).split("\n");
+    rows.push([j+1,x.t,ls.length+":"+(ls[ls.length-1].length+1),x.src,"pessoa",when]);
+  });
+  const termsToRemove=[...new Set(acc.map(x=>x.v))];
+  const ext=f.name.split(".").pop().toLowerCase();
+  const fileData=await buildProtectedFile(f,termsToRemove);
+
+  // verificação real: relê o arquivo gerado e procura os valores removidos
+  let chk="";
+  try{
+    if(["docx","pptx","xlsx","xls","csv"].includes(ext))chk=await parseTextFromBuf(new Uint8Array(fileData).buffer.slice(0),ext);
+    else if(ext!=="pdf")chk=new TextDecoder().decode(fileData);
+  }catch(e){chk=""}
+  const chkL=chk.toLowerCase();
+  const left=ext==="pdf"?(f.missed||[]):termsToRemove.filter(v=>chkL.includes(v.toLowerCase()));
+
+  const h1=await sha(f.buf?new Uint8Array(f.buf.slice(0)):text),h2=await sha(fileData),id=String(i+1).padStart(3,"0")+"_"+base(f.name);
+  outs.push({
+    name:f.name,
+    outFileName:f.name,
+    id:id,fileData:fileData,rows:rows,left:left.length,kept:f.F.length-acc.length,h1:h1,h2:h2,
+    csv:"\ufeffarquivo;"+f.name+"\nhash_original;"+h1+"\nhash_protegido;"+h2+"\n#;tipo;local;origem;decidido_por;horario\n"+rows.map(x=>x.join(";")).join("\n")
+  });
+ }
+ }catch(e){console.error(e);$("amsg").textContent="Erro ao gerar arquivos: "+(e.message||e);say("Erro ao gerar arquivos");return}
  rsel=0;drawRes();go(2);say(`${outs.length} versão(ões) protegida(s) gerada(s).`)};
+
 function drawRes(){
- $("sum").innerHTML=outs.map((o,i)=>`<tr><th scope="row" style="white-space:normal;word-break:break-all">${esc(o.name)}</th><td>${o.rows.length}</td><td>${o.kept}</td><td>${o.left?`<span class="low">${o.left} valor(es) ainda no texto</span>`:`<span class="good">✓ Passou</span>`}</td><td><button class="sm" data-v="${i}" aria-label="Ver registro de ${esc(o.name)}">Ver registro</button> <button class="sm" data-c="${i}" aria-label="Baixar CSV de ${esc(o.name)}">CSV</button></td></tr>`).join("");
+ $("sum").innerHTML=outs.map((o,i)=>`<tr><th scope="row" style="white-space:normal;word-break:break-all">${esc(o.name)}</th><td>${o.rows.length}</td><td>${o.kept}</td><td>${o.left?`<span class="low">${o.left} valor(es) ainda no arquivo</span>`:`<span class="good">✓ Passou</span>`}</td><td><button class="sm" data-v="${i}" aria-label="Ver registro de ${esc(o.name)}">Ver registro</button> <button class="sm" data-c="${i}" aria-label="Baixar CSV de ${esc(o.name)}">CSV</button></td></tr>`).join("");
  const o=outs[rsel];if(!o)return;
  $("hdr").innerHTML=`<b>${esc(o.name)}</b> · Original (SHA-256): <code>${o.h1}…</code> · Protegido: <code>${o.h2}…</code> · ${o.rows.length} remoções`;
  $("log").innerHTML=o.rows.length?o.rows.map(x=>"<tr>"+x.map(c=>`<td>${esc(c)}</td>`).join("")+"</tr>").join(""):`<tr><td colspan="6">Nenhuma remoção aceita neste arquivo.</td></tr>`}
+
 async function save(filename,data){
  try{let d=null;try{d=window.claude&&await claude.use("downloads")}catch(e){}
   if(d)await d.save({filename,data});
   else{const a=document.createElement("a"),u=URL.createObjectURL(new Blob([data]));a.href=u;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),4000)}
   $("msg").textContent="Salvo: "+filename}
  catch(e){$("msg").textContent=e&&e.code=="declined"?"Download cancelado.":"Não foi possível salvar."}say($("msg").textContent)}
+
 $("sum").onclick=e=>{const b=e.target.closest("button");if(!b)return;
  if(b.dataset.v!=null){rsel=+b.dataset.v;drawRes();say("Registro de "+outs[rsel].name+" exibido")}
  if(b.dataset.c!=null){const o=outs[+b.dataset.c];save("registro_"+o.id.replace(/\.[^.]+$/,"")+".csv",new TextEncoder().encode(o.csv))}};
+
 $("zip").onclick=async()=>{const z=new JSZip();
- outs.forEach(o=>{const n=o.id.replace(/\.[^.]+$/,"");z.file("protegidos/"+n+"_protegido.txt",o.r);z.file("registros/"+n+"_registro.csv",o.csv)});
+ outs.forEach(o=>{const n=o.id.replace(/\.[^.]+$/,"");
+  z.file("protegidos/"+o.outFileName,o.fileData);
+  z.file("registros/"+n+"_registro.csv",o.csv);
+ });
  await save("documentos_protegidos.zip",await z.generateAsync({type:"uint8array",compression:"DEFLATE"}))};
+
 /* acessibilidade */
 const R=document.documentElement;let fs=+pref("fs")||100;
 const setFs=v=>{fs=Math.min(150,Math.max(85,v));R.style.fontSize=fs+"%";pref("fs",fs);say("Tamanho do texto: "+fs+"%")};
@@ -305,7 +473,6 @@ function tog(id,attr,val){const b=$(id);b.onclick=()=>{const on=b.getAttribute("
  if(attr=="hc")on?R.setAttribute("data-hc",""):R.removeAttribute("data-hc");else R.setAttribute("data-theme",on?"dark":"light");say(b.textContent+(on?" ativado":" desativado"))}}
 tog("hc","hc");tog("dk","theme");
 if(matchMedia("(prefers-color-scheme:dark)").matches)$("dk").setAttribute("aria-pressed","true");
-/* Libras (VLibras): o script só carrega em páginas hospedadas fora deste visualizador */
 {const s=document.createElement("script");s.src="https://vlibras.gov.br/app/vlibras-plugin.js";
  s.onload=()=>{try{new window.VLibras.Widget("https://vlibras.gov.br/app")}catch(e){}};
  s.onerror=()=>{$("vlmsg").textContent="Libras: o tradutor VLibras não pôde ser carregado neste ambiente de visualização. Ao publicar em seu site, ele aparece como um botão no canto da tela."};
